@@ -1,0 +1,126 @@
+---
+version: '3.8'
+
+networks:
+  local-net:
+
+services:
+
+  kafka:
+    image: apache/kafka:3.8.0
+    hostname: kafka
+    container_name: kafka
+    ports:
+      - "9092:9092"
+      - "9997:9997"
+    networks:
+      - local-net
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: 'CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT'
+      KAFKA_ADVERTISED_LISTENERS: 'PLAINTEXT://kafka:29092,PLAINTEXT_HOST://:9092'
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_JMX_PORT: 9997
+      KAFKA_JMX_OPTS: -Dcom.sun.management.jmxremote -Dcom.sun.management.jmxremote.authenticate=false -Dcom.sun.management.jmxremote.ssl=false -Djava.rmi.server.hostname=kafka -Dcom.sun.management.jmxremote.rmi.port=9997
+      KAFKA_PROCESS_ROLES: 'broker,controller'
+      KAFKA_NODE_ID: 1
+      KAFKA_CONTROLLER_QUORUM_VOTERS: '1@kafka:29093'
+      KAFKA_LISTENERS: 'PLAINTEXT://kafka:29092,CONTROLLER://kafka:29093,PLAINTEXT_HOST://:9092'
+      KAFKA_INTER_BROKER_LISTENER_NAME: 'PLAINTEXT'
+      KAFKA_CONTROLLER_LISTENER_NAMES: 'CONTROLLER'
+      KAFKA_LOG_DIRS: '/tmp/kraft-combined-logs'
+
+  create-kafka-topics:
+    image: apache/kafka:3.8.0
+    depends_on:
+      - kafka
+    networks:
+      - local-net
+    entrypoint: [ '/bin/sh', '-c' ]
+    command: |
+      "
+      # blocks until kafka is reachable
+      sh /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:29092 --list
+      echo -e 'Creating kafka topics'
+      sh /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:29092 --create --if-not-exists --topic alert-cond-topic --replication-factor 1 --partitions 1
+      sh /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:29092 --create --if-not-exists --topic user-management-topic --replication-factor 1 --partitions 1
+      sh /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:29092 --create --if-not-exists --topic priority-alert-topic --replication-factor 1 --partitions 1
+      sh /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:29092 --create --if-not-exists --topic standard-alert-topic --replication-factor 1 --partitions 1
+      echo -e 'Successfully created the following topics:'
+      sh /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:29092 --list
+      "
+
+  kafka-ui:
+    container_name: kafka-ui
+    image: provectuslabs/kafka-ui:latest
+    ports:
+      - "8080:8080"
+    depends_on:
+      - kafka
+    networks:
+      - local-net
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local_cluster
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29092
+      KAFKA_CLUSTERS_0_METRICS_PORT: 9997
+      DYNAMIC_CONFIG_ENABLED: 'true'
+
+  jobmanager:
+    image: flink:1.18.1-scala_2.12
+    depends_on:
+      create-kafka-topics:
+        condition: service_completed_successfully
+    ports:
+      - "7070:7070"
+    command: standalone-job --is.run.test.case TRUE --alerts.suppression.in.min 1 --aws.region ap-south-1 --alerts.allowed.lateness.in.min 1 --alerts.allowed.burst.rate.per.sec 10 --user.preference.state.ttl.in.days 7 --kafka.campaign.bootstrap.brokers kafka:9092 --kafka.edge.alerts.campaign.input.topic alert-cond-topic --kafka.campaign.group.id EdgeAlertsCampaignGroup --kafka.campaign.role.arn NotNeeded --kafka.campaign.session.name EdgeAlertsCampaignSession --kafka.userpref.bootstrap.brokers --kafka.userpref.bootstrap.brokers kafka:9092 --kafka.userpref.input.topic user-management-topic --kafka.userpref.group.id EdgeAlertsUserPrefGroup --kafka.userpref.role.arn NotNeeded --kafka.userpref.session.name EdgeAlertsUserPrefSession --kafka.notification.bootstrap.brokers kafka:9092 --kafka.notification.priority.topic priority-alert-topic --kafka.notification.standard.topic standard-alert-topic --kafka.notification.group.id EdgeAlertsNotificationGroup --kafka.notification.role.arn NotNeeded --kafka.notification.session.name EdgeAlertsNotificationSession --sink.acks all
+    volumes:
+      - type: bind
+        source: ./../target/edgealerts-1.0.0-SNAPSHOT.jar
+        target: /opt/flink/usrlib/edgealerts.jar
+      - type: bind
+        source: ./log4j2.properties
+        target: /opt/flink/conf/log4j.properties
+      - type: bind
+        source: ./log4j2.properties
+        target: /opt/flink/conf/log4j-console.properties
+    networks:
+      - local-net
+    environment:
+      - |
+        FLINK_PROPERTIES=
+        jobmanager.rpc.address: jobmanager
+        parallelism.default: 1
+        rest.port: 7070
+        rest.address: localhost
+        rest.bind-address: 0.0.0.0
+
+  taskmanager:
+
+    image: flink:1.18.1-scala_2.12
+    depends_on:
+      - jobmanager
+    command: taskmanager
+    volumes:
+      - type: bind
+        source: ./../target/edgealerts-1.0.0-SNAPSHOT.jar
+        target: /opt/flink/usrlib/edgealerts.jar
+      - type: bind
+        source: ./log4j2.properties
+        target: /opt/flink/conf/log4j.properties
+      - type: bind
+        source: ./log4j2.properties
+        target: /opt/flink/conf/log4j-console.properties
+    scale: 1
+    networks:
+      - local-net
+    environment:
+      - |
+        FLINK_PROPERTIES=
+        jobmanager.rpc.address: jobmanager
+        taskmanager.numberOfTaskSlots: 1
+        rest.port: 7070
+        rest.address: localhost
+        rest.bind-address: 0.0.0.0
